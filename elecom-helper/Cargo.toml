@@ -1,0 +1,20 @@
+[package]
+name = "openmouse-elecom"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Offline, event-driven macOS EX-G PRO button remapper for OpenMouse"
+
+[dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "net", "signal", "sync"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,3 +1,5 @@
 /target
+/elecom-helper/target
+/elecom-helper/dist
 native-hid/node_modules
 .DS_Store

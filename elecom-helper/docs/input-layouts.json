@@ -1,0 +1,213 @@
+{
+  "source": "User-provided ELECOM Mouse Assistant 6.4.0 device_setting.json",
+  "source_zip_sha256": "15299463b6162a1f86bd0daede567500605a5653874bf4315320af7c0776e28a",
+  "hardware_verified": false,
+  "offset_convention": "Original manufacturer JSON bit offsets; report-ID inclusion must be verified before decoding.",
+  "devices": [
+    {
+      "family": "M-XGx50MB",
+      "vendor_id": 1390,
+      "vendor_id_hex": "0x056E",
+      "product_id": 317,
+      "product_id_hex": "0x013D",
+      "transport": "wireless",
+      "configuration_type": "Soft",
+      "button_count": 8,
+      "has_tilt": true,
+      "mouse_input_reports": [
+        {
+          "id": 1,
+          "darwin": {
+            "usage_page": 1,
+            "usage": 2
+          },
+          "button": [
+            8,
+            8
+          ],
+          "wheel": [
+            48,
+            8
+          ],
+          "tilt": [
+            56,
+            8
+          ],
+          "x": [
+            16,
+            16
+          ],
+          "y": [
+            32,
+            16
+          ]
+        }
+      ],
+      "feature_reports": []
+    },
+    {
+      "family": "M-XGx50MB",
+      "vendor_id": 1390,
+      "vendor_id_hex": "0x056E",
+      "product_id": 318,
+      "product_id_hex": "0x013E",
+      "transport": "bluetooth",
+      "configuration_type": "Soft",
+      "button_count": 8,
+      "has_tilt": true,
+      "mouse_input_reports": [
+        {
+          "id": 2,
+          "darwin": {
+            "usage_page": 1,
+            "usage": 2
+          },
+          "button": [
+            8,
+            8
+          ],
+          "wheel": [
+            48,
+            8
+          ],
+          "tilt": [
+            56,
+            8
+          ],
+          "x": [
+            16,
+            16
+          ],
+          "y": [
+            32,
+            16
+          ]
+        }
+      ],
+      "feature_reports": []
+    },
+    {
+      "family": "M-XPT1MR",
+      "vendor_id": 1390,
+      "vendor_id_hex": "0x056E",
+      "product_id": 296,
+      "product_id_hex": "0x0128",
+      "transport": "wired",
+      "configuration_type": "Soft",
+      "button_count": 8,
+      "has_tilt": true,
+      "mouse_input_reports": [
+        {
+          "id": 1,
+          "darwin": {
+            "usage_page": 1,
+            "usage": 2
+          },
+          "button": [
+            8,
+            8
+          ],
+          "wheel": [
+            48,
+            8
+          ],
+          "tilt": [
+            56,
+            8
+          ],
+          "x": [
+            16,
+            16
+          ],
+          "y": [
+            32,
+            16
+          ]
+        }
+      ],
+      "feature_reports": []
+    },
+    {
+      "family": "M-XPT1MR",
+      "vendor_id": 1390,
+      "vendor_id_hex": "0x056E",
+      "product_id": 297,
+      "product_id_hex": "0x0129",
+      "transport": "wireless",
+      "configuration_type": "Soft",
+      "button_count": 8,
+      "has_tilt": true,
+      "mouse_input_reports": [
+        {
+          "id": 1,
+          "darwin": {
+            "usage_page": 1,
+            "usage": 2
+          },
+          "button": [
+            8,
+            8
+          ],
+          "wheel": [
+            48,
+            8
+          ],
+          "tilt": [
+            56,
+            8
+          ],
+          "x": [
+            16,
+            16
+          ],
+          "y": [
+            32,
+            16
+          ]
+        }
+      ],
+      "feature_reports": []
+    },
+    {
+      "family": "M-XPT1MR",
+      "vendor_id": 1390,
+      "vendor_id_hex": "0x056E",
+      "product_id": 304,
+      "product_id_hex": "0x0130",
+      "transport": "bluetooth",
+      "configuration_type": "Soft",
+      "button_count": 8,
+      "has_tilt": true,
+      "mouse_input_reports": [
+        {
+          "id": 1,
+          "darwin": {
+            "usage_page": 1,
+            "usage": 2
+          },
+          "button": [
+            8,
+            8
+          ],
+          "wheel": [
+            48,
+            8
+          ],
+          "tilt": [
+            56,
+            8
+          ],
+          "x": [
+            16,
+            16
+          ],
+          "y": [
+            32,
+            16
+          ]
+        }
+      ],
+      "feature_reports": []
+    }
+  ]
+}
