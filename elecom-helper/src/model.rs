@@ -23,16 +23,76 @@ pub fn button_mask(pid: u32, report_id: u32, bytes: &[u8]) -> Option<u8> {
         _ => None,
     }
 }
+// Real Bluetooth M-XG*50MBSK declares only five standard mouse buttons.
+// Fn buttons arrive in the vendor input report 0x10, not in report 2.
+// Accept only this observed device/header/length; never decode arbitrary
+// vendor packets or the mouse's keyboard/consumer collections as buttons.
+pub fn button_update(pid: u32, report_id: u32, bytes: &[u8]) -> Option<(u8, u8)> {
+    if pid == 0x013e && report_id == 0x10 {
+        let payload = match bytes {
+            [0x10, payload @ ..] if payload.len() == 16 => payload,
+            payload if payload.len() == 16 => payload,
+            _ => return None,
+        };
+        return (payload[0] == 0x12 && payload[1] == 0x12).then_some((payload[2] & 0xe0, 0xe0));
+    }
+    button_mask(pid, report_id, bytes).map(|mask| {
+        let scope = if pid == 0x013e { 0x1f } else { 0xff };
+        (mask & scope, scope)
+    })
+}
 
 #[derive(Default)]
 pub struct ButtonState {
     previous: Option<u8>,
+    initialised: u8,
 }
 impl ButtonState {
+    #[cfg(test)]
     pub fn transition(&mut self, mask: u8) -> Option<(u8, u8)> {
-        let current = mask & 0xe0;
+        self.transition_scoped(mask, 0xff)
+    }
+    pub fn transition_scoped(&mut self, mask: u8, scope: u8) -> Option<(u8, u8)> {
+        let current = (self.previous.unwrap_or(0) & !scope) | (mask & scope);
         let previous = self.previous.replace(current).unwrap_or(current);
+        let new_scope = scope & !self.initialised;
+        self.initialised |= scope;
+        if new_scope != 0 {
+            // Standard and vendor reports each establish their own baseline.
+            // An already held Fn button must not fire after an idle standard
+            // report happened to arrive first during startup/reconnection.
+            return (scope != 0xff).then_some((current, current));
+        }
         (previous != current).then_some((previous, current))
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ButtonObservation {
+    pub pressed_mask: Option<u8>,
+    pub press_counts: [u64; 8],
+    pub last_button: Option<u8>,
+}
+impl ButtonObservation {
+    pub fn update(&mut self, mask: u8) {
+        // The first packet establishes state, without treating an already held
+        // button as a fresh press. Keep quick clicks visible through counters.
+        let previous = self.pressed_mask.replace(mask).unwrap_or(mask);
+        for button in 1..=8 {
+            if mask & !previous & (1 << (button - 1)) != 0 {
+                self.press_counts[button - 1] = self.press_counts[button - 1].saturating_add(1);
+                self.last_button = Some(button as u8);
+            }
+        }
+    }
+}
+
+pub fn identify_until(active: bool, now: u64) -> u64 {
+    if active {
+        now.saturating_add(30_000)
+    } else {
+        0
     }
 }
 
@@ -65,16 +125,24 @@ pub enum SystemAction {
     MissionControl,
     ApplicationWindows,
     ShowDesktop,
+    ApplicationSwitcher,
 }
 impl SystemAction {
-    // Installed Apple's Mission Control binary dispatches 0/1/2 to Dock.
-    // Keep arguments fixed; never accept command strings or executable paths.
-    pub fn argument(&self) -> &'static str {
-        match self {
-            Self::MissionControl => "0",
-            Self::ShowDesktop => "1",
-            Self::ApplicationWindows => "2",
-        }
+    pub fn symbolic_id(&self) -> Option<&'static [u8]> {
+        Some(match self {
+            Self::MissionControl => b"32\0",
+            Self::ShowDesktop => b"36\0",
+            Self::ApplicationWindows => b"33\0",
+            Self::ApplicationSwitcher => return None,
+        })
+    }
+    pub fn default_key(&self) -> Option<(u16, u64)> {
+        Some(match self {
+            Self::MissionControl => (126, 1 << 18),
+            Self::ApplicationWindows => (125, 1 << 18),
+            Self::ShowDesktop => (103, 0),
+            Self::ApplicationSwitcher => return None,
+        })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -116,7 +184,7 @@ impl Config {
         }
         Ok(())
     }
-    pub fn actions(&self, family: &str, previous: u8, current: u8) -> Vec<Action> {
+    pub fn actions(&self, family: &str, previous: u8, current: u8) -> Vec<(u8, Action)> {
         if !self.enabled {
             return Vec::new();
         }
@@ -126,7 +194,7 @@ impl Config {
             .into_iter()
             .flat_map(|bindings| bindings.iter())
             .filter(|(button, _)| rising & (1 << (**button - 1)) != 0)
-            .map(|(_, action)| action.clone())
+            .map(|(button, action)| (*button, action.clone()))
             .collect()
     }
 }
@@ -147,6 +215,36 @@ mod tests {
         assert_eq!(button_mask(0x013e, 1, &[1, 0xe0, 0, 0, 0, 0, 0, 0]), None);
         assert_eq!(button_mask(0x013e, 2, &[2, 0xe0]), None);
         assert_eq!(button_mask(0x9999, 2, &[2, 0xe0, 0, 0, 0, 0, 0, 0]), None);
+    }
+    #[test]
+    fn bluetooth_vendor_fn_reports_merge_with_primary_buttons_without_false_release() {
+        let mut state = ButtonState::default();
+        assert_eq!(state.transition_scoped(0, 0x1f), Some((0, 0)));
+        let frame = [
+            0x10, 0x12, 0x12, 0x20, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(button_update(0x013e, 16, &frame), Some((0x20, 0xe0)));
+        assert_eq!(button_update(0x013e, 16, &frame[1..]), Some((0x20, 0xe0)));
+        let (mask, scope) = button_update(0x013e, 16, &frame).unwrap();
+        assert_eq!(state.transition_scoped(mask, scope), Some((0x20, 0x20)));
+        assert_eq!(state.transition_scoped(1, 0x1f), Some((0x20, 0x21)));
+        assert_eq!(state.transition_scoped(0, 0x1f), Some((0x21, 0x20)));
+        assert_eq!(state.transition_scoped(mask, scope), None);
+        assert_eq!(state.transition_scoped(0, 0xe0), Some((0x20, 0)));
+        assert_eq!(state.transition_scoped(0x20, 0xe0), Some((0, 0x20)));
+        assert_eq!(button_update(0x013d, 16, &frame), None);
+        assert_eq!(button_update(0x013e, 16, &frame[..8]), None);
+        let mut wrong_header = frame;
+        wrong_header[2] = 0x13;
+        assert_eq!(button_update(0x013e, 16, &wrong_header), None);
+        let mut wrong_id = frame;
+        wrong_id[0] = 0x20;
+        assert_eq!(button_update(0x013e, 16, &wrong_id), None);
+        for mask in [0x20, 0x40, 0x80, 0xe0, 0] {
+            let mut packet = frame;
+            packet[3] = mask;
+            assert_eq!(button_update(0x013e, 16, &packet), Some((mask, 0xe0)));
+        }
     }
     fn configured() -> Config {
         let mut c = Config {
@@ -211,13 +309,31 @@ mod tests {
         let c = configured();
         let mut state = ButtonState::default();
         assert_eq!(state.transition(0x20), None);
-        assert_eq!(state.transition(0x21), None); // primary click is ignored
+        let (previous, current) = state.transition(0x21).unwrap();
+        assert!(c.actions("mouse", previous, current).is_empty());
         let (previous, current) = state.transition(0).unwrap();
         assert!(c.actions("mouse", previous, current).is_empty());
         let (previous, current) = state.transition(0x20).unwrap();
         assert_eq!(c.actions("mouse", previous, current).len(), 1);
         assert_eq!(state.transition(0x20), None);
         assert_eq!(ButtonState::default().transition(0x20), None);
+    }
+    #[test]
+    fn observation_keeps_quick_clicks_and_startup_does_not_count_held_buttons() {
+        let mut observation = ButtonObservation::default();
+        observation.update(0x20);
+        assert_eq!(observation.press_counts, [0; 8]);
+        observation.update(0);
+        observation.update(0x81);
+        observation.update(0x81);
+        observation.update(0);
+        assert_eq!(observation.press_counts, [1, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(observation.last_button, Some(8));
+        assert_eq!(observation.pressed_mask, Some(0));
+        observation.update(0x80);
+        assert_eq!(observation.press_counts[7], 2);
+        assert_eq!(identify_until(true, 100), 30_100);
+        assert_eq!(identify_until(false, 100), 0);
     }
     #[test]
     fn legacy_shortcuts_and_system_actions_round_trip_and_trigger_once() {
@@ -228,7 +344,12 @@ mod tests {
             serde_json::to_value(&c).unwrap(),
             serde_json::from_str::<serde_json::Value>(legacy).unwrap()
         );
-        for name in ["missionControl", "applicationWindows", "showDesktop"] {
+        for name in [
+            "missionControl",
+            "applicationWindows",
+            "showDesktop",
+            "applicationSwitcher",
+        ] {
             let json = format!(
                 r#"{{"enabled":true,"mappings":{{"mouse":{{"6":{{"systemAction":"{name}"}}}}}}}}"#
             );
@@ -242,6 +363,11 @@ mod tests {
                 serde_json::from_str::<serde_json::Value>(&json).unwrap()
             );
         }
+    }
+    #[test]
+    fn persistent_picker_has_no_synthetic_key_fallback() {
+        assert!(SystemAction::ApplicationSwitcher.default_key().is_none());
+        assert!(SystemAction::ApplicationSwitcher.symbolic_id().is_none());
     }
     #[test]
     fn arbitrary_commands_and_mixed_action_fields_are_rejected() {

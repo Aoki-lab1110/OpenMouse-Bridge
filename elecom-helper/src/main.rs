@@ -1,3 +1,4 @@
+mod keyboard;
 #[cfg(target_os = "macos")]
 mod macos;
 mod model;
@@ -16,7 +17,10 @@ use serde::Serialize;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -28,6 +32,10 @@ mod macos {
         (false, false)
     }
     pub fn request_permissions() {}
+    pub fn cancel_shortcuts() {}
+    pub fn perform_action(_: &crate::model::Action) -> Result<(), String> {
+        Err("macOS is required".into())
+    }
 }
 
 struct Shared {
@@ -37,6 +45,19 @@ struct Shared {
     path: PathBuf,
     ui_dir: Option<PathBuf>,
     quit: tokio::sync::Notify,
+    identify_until: AtomicU64,
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+impl Shared {
+    fn identifying(&self) -> bool {
+        self.identify_until.load(Ordering::Relaxed) > now_ms()
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,12 +68,14 @@ struct Status {
     config: Config,
     devices: Vec<macos::DeviceStatus>,
     error: Option<String>,
+    identifying: bool,
 }
 
 async fn status(State(shared): State<Arc<Shared>>) -> Result<Json<Status>, StatusCode> {
     let (accessibility, input_monitoring) = macos::permissions();
     Ok(Json(Status {
         version: env!("CARGO_PKG_VERSION"),
+        identifying: shared.identifying(),
         accessibility,
         input_monitoring,
         config: shared
@@ -99,6 +122,7 @@ async fn save(
         Ok(())
     };
     persist().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    macos::cancel_shortcuts();
     *active = config.clone();
     Ok(Json(config))
 }
@@ -107,8 +131,75 @@ async fn permissions() -> Json<serde_json::Value> {
     Json(serde_json::json!({"ok":true}))
 }
 async fn quit(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
+    shared.identify_until.store(u64::MAX, Ordering::Relaxed);
+    macos::cancel_shortcuts();
     shared.quit.notify_one();
     Json(serde_json::json!({"ok":true}))
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentifyRequest {
+    active: bool,
+}
+async fn identify(
+    State(shared): State<Arc<Shared>>,
+    Json(request): Json<IdentifyRequest>,
+) -> Json<serde_json::Value> {
+    shared.identify_until.store(
+        model::identify_until(request.active, now_ms()),
+        Ordering::Relaxed,
+    );
+    if request.active {
+        macos::cancel_shortcuts();
+    }
+    Json(serde_json::json!({"identifying": shared.identifying()}))
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestRequest {
+    family: String,
+    button: u8,
+}
+async fn test_binding(
+    State(shared): State<Arc<Shared>>,
+    Json(request): Json<TestRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !matches!(request.family.as_str(), "mouse" | "trackball")
+        || !(6..=8).contains(&request.button)
+    {
+        return Err((StatusCode::BAD_REQUEST, "Unsupported button".into()));
+    }
+    if shared.identifying() {
+        return Err((
+            StatusCode::CONFLICT,
+            "ボタン確認を終了してから試してください。".into(),
+        ));
+    }
+    let action = {
+        let config = shared.config.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Configuration lock failed".into(),
+            )
+        })?;
+        if !config.enabled {
+            return Err((
+                StatusCode::CONFLICT,
+                "割り当てを有効にして保存してください。".into(),
+            ));
+        }
+        config
+            .mappings
+            .get(&request.family)
+            .and_then(|bindings| bindings.get(&request.button))
+            .cloned()
+            .ok_or((
+                StatusCode::CONFLICT,
+                "このボタンに操作を割り当てて保存してください。".into(),
+            ))?
+    };
+    macos::perform_action(&action).map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 // Exact loopback Host + Origin checks apply to every endpoint, including
@@ -218,6 +309,8 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/elecom", get(status).put(save))
         .route("/v1/elecom/permissions", put(permissions))
         .route("/v1/elecom/quit", put(quit))
+        .route("/v1/elecom/identify", put(identify))
+        .route("/v1/elecom/test", put(test_binding))
         .fallback(static_ui)
         .layer(middleware::from_fn(local_only))
         .with_state(shared)
@@ -227,6 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut path = None;
     let mut ui_dir = None;
+    let mut safe_start = false;
     // A Finder-launched bundle uses its own offline resources. CLI use remains
     // explicit and never opens a browser without a bundled UI.
     let bundled_ui = std::env::current_exe()
@@ -236,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let open_browser = bundled_ui.is_some();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--safe-start" => safe_start = true,
             "--config" => {
                 path = Some(PathBuf::from(
                     args.next().ok_or("--config requires a path")?,
@@ -248,7 +343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" => {
                 println!(
-                    "openmouse-elecom [--config PATH] [--ui-dir OpenMouse/dist-elecom]\nLocal UI: http://127.0.0.1:17847\nNo updates, telemetry, game monitoring or outbound network requests."
+                    "openmouse-elecom [--config PATH] [--ui-dir OpenMouse/dist-elecom] [--safe-start]\n--safe-start: load saved mappings with actions disabled until saved from the UI.\nLocal UI: http://127.0.0.1:17847\nNo updates, telemetry, game monitoring or outbound network requests."
                 );
                 return Ok(());
             }
@@ -259,12 +354,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
             .join("Library/Application Support/OpenMouse/elecom.json")
     });
-    let config = match std::fs::read(&path) {
+    let mut config = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice::<Config>(&bytes)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(e) => return Err(e.into()),
     };
     config.validate()?;
+    if safe_start {
+        config.enabled = false;
+    }
     let ui_dir = ui_dir
         .or(bundled_ui)
         .map(|path| path.canonicalize())
@@ -276,6 +374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         path,
         ui_dir,
         quit: tokio::sync::Notify::new(),
+        identify_until: AtomicU64::new(0),
     });
     // Bind first so two copies never install duplicate input listeners.
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:17847").await {
@@ -329,6 +428,42 @@ mod tests {
         assert!(!valid_headers(&h, &Method::GET));
     }
     #[tokio::test]
+    async fn identify_mode_expires_and_never_changes_persisted_bindings() {
+        let shared = Arc::new(Shared {
+            config: Mutex::new(Config::default()),
+            devices: Mutex::new(BTreeMap::new()),
+            error: Mutex::new(None),
+            path: std::env::temp_dir().join("openmouse-identify-no-write.json"),
+            ui_dir: None,
+            quit: tokio::sync::Notify::new(),
+            identify_until: AtomicU64::new(0),
+        });
+        for active in [true, false] {
+            let request = Request::builder()
+                .method("PUT")
+                .uri("/v1/elecom/identify")
+                .header("host", "127.0.0.1:17847")
+                .header("origin", "http://127.0.0.1:17847")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"active":{active}}}"#)))
+                .unwrap();
+            assert_eq!(
+                router(shared.clone())
+                    .oneshot(request)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(shared.identifying(), active);
+            assert_eq!(*shared.config.lock().unwrap(), Config::default());
+        }
+        shared
+            .identify_until
+            .store(now_ms().saturating_sub(1), Ordering::Relaxed);
+        assert!(!shared.identifying());
+    }
+    #[tokio::test]
     async fn invalid_mapping_never_updates_active_or_saved_config() {
         let path = std::env::temp_dir().join(format!(
             "openmouse-elecom-invalid-{}.json",
@@ -341,6 +476,7 @@ mod tests {
             path: path.clone(),
             ui_dir: None,
             quit: tokio::sync::Notify::new(),
+            identify_until: AtomicU64::new(0),
         });
         let request = Request::builder().method("PUT").uri("/v1/elecom")
             .header("host", "127.0.0.1:17847").header("origin", "http://127.0.0.1:17847").header("content-type", "application/json")
@@ -349,5 +485,93 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(*shared.config.lock().unwrap(), Config::default());
         assert!(!path.exists());
+    }
+    #[tokio::test]
+    async fn action_test_rejects_unmapped_disabled_and_untrusted_requests_without_posting() {
+        let shared = Arc::new(Shared {
+            config: Mutex::new(Config::default()),
+            devices: Mutex::new(BTreeMap::new()),
+            error: Mutex::new(None),
+            path: std::env::temp_dir().join("openmouse-test-no-write.json"),
+            ui_dir: None,
+            quit: tokio::sync::Notify::new(),
+            identify_until: AtomicU64::new(0),
+        });
+        for (body, origin, expected) in [
+            (
+                r#"{"family":"mouse","button":7}"#,
+                "https://attacker.example",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                r#"{"family":"other","button":7}"#,
+                "http://127.0.0.1:17847",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"family":"mouse","button":1}"#,
+                "http://127.0.0.1:17847",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"family":"mouse","button":7,"systemAction":"missionControl"}"#,
+                "http://127.0.0.1:17847",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                r#"{"family":"mouse","button":7}"#,
+                "http://127.0.0.1:17847",
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let request = Request::builder()
+                .method("PUT")
+                .uri("/v1/elecom/test")
+                .header("host", "127.0.0.1:17847")
+                .header("origin", origin)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                router(shared.clone())
+                    .oneshot(request)
+                    .await
+                    .unwrap()
+                    .status(),
+                expected
+            );
+        }
+        shared.config.lock().unwrap().enabled = true;
+        let request = || {
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/elecom/test")
+                .header("host", "127.0.0.1:17847")
+                .header("origin", "http://127.0.0.1:17847")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"family":"mouse","button":7}"#))
+                .unwrap()
+        };
+        assert_eq!(
+            router(shared.clone())
+                .oneshot(request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        shared
+            .identify_until
+            .store(now_ms() + 30_000, Ordering::Relaxed);
+        assert_eq!(
+            router(shared.clone())
+                .oneshot(request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(shared.config.lock().unwrap().mappings.is_empty());
+        assert!(shared.error.lock().unwrap().is_none());
     }
 }

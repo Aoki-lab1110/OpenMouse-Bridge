@@ -209,5 +209,34 @@
       ],
       "feature_reports": []
     }
-  ]
+  ],
+  "hardware_observation": {
+    "date": "2026-10-10",
+    "vendor_id": 1390,
+    "product_id": 318,
+    "transport": "Bluetooth Low Energy",
+    "standard_report": {
+      "id": 2,
+      "button_scope": 31,
+      "descriptor_buttons": 5
+    },
+    "extra_report": {
+      "id": 16,
+      "length_with_id": 17,
+      "payload_length": 16,
+      "payload_prefix": [
+        18,
+        18
+      ],
+      "button_byte_in_payload": 2,
+      "button_scope": 224,
+      "observed_press_masks": {
+        "Fn1": 32,
+        "Fn2": 64,
+        "Fn3": 128
+      },
+      "observed_release_mask": 0
+    },
+    "note": "Catalog-derived 8-bit standard report was incomplete for this Bluetooth device. Other product IDs are not hardware verified."
+  }
 }
