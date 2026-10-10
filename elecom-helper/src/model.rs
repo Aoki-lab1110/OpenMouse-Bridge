@@ -59,12 +59,42 @@ pub struct Shortcut {
     pub modifiers: Modifiers,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum SystemAction {
+    MissionControl,
+    ApplicationWindows,
+    ShowDesktop,
+}
+impl SystemAction {
+    // Installed Apple's Mission Control binary dispatches 0/1/2 to Dock.
+    // Keep arguments fixed; never accept command strings or executable paths.
+    pub fn argument(&self) -> &'static str {
+        match self {
+            Self::MissionControl => "0",
+            Self::ShowDesktop => "1",
+            Self::ApplicationWindows => "2",
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemBinding {
+    pub system_action: SystemAction,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Action {
+    Shortcut(Shortcut),
+    System(SystemBinding),
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub enabled: bool,
     #[serde(default)]
-    pub mappings: BTreeMap<String, BTreeMap<u8, Shortcut>>,
+    pub mappings: BTreeMap<String, BTreeMap<u8, Action>>,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -77,7 +107,8 @@ impl Config {
                     return Err("Only extra buttons 6, 7 and 8 can be remapped");
                 }
                 // Modifier-only keys and arbitrary/undefined virtual key codes are excluded.
-                if !matches!(action.key_code, 0..=9 | 11..=49 | 51 | 53 | 96..=101 | 103 | 109 | 111 | 115..=126)
+                if let Action::Shortcut(shortcut) = action
+                    && !matches!(shortcut.key_code, 0..=9 | 11..=49 | 51 | 53 | 96..=101 | 103 | 109 | 111 | 115..=126)
                 {
                     return Err("Unsupported keyboard key code");
                 }
@@ -85,7 +116,7 @@ impl Config {
         }
         Ok(())
     }
-    pub fn actions(&self, family: &str, previous: u8, current: u8) -> Vec<Shortcut> {
+    pub fn actions(&self, family: &str, previous: u8, current: u8) -> Vec<Action> {
         if !self.enabled {
             return Vec::new();
         }
@@ -126,13 +157,13 @@ mod tests {
             "mouse".into(),
             BTreeMap::from([(
                 6,
-                Shortcut {
+                Action::Shortcut(Shortcut {
                     key_code: 8,
                     modifiers: Modifiers {
                         command: true,
                         ..Modifiers::default()
                     },
-                },
+                }),
             )]),
         );
         c
@@ -160,19 +191,18 @@ mod tests {
         let mut c = configured();
         c.mappings.get_mut("mouse").unwrap().insert(
             1,
-            Shortcut {
+            Action::Shortcut(Shortcut {
                 key_code: 8,
                 modifiers: Modifiers::default(),
-            },
+            }),
         );
         assert!(c.validate().is_err());
         c.mappings.get_mut("mouse").unwrap().remove(&1);
-        c.mappings
-            .get_mut("mouse")
-            .unwrap()
-            .get_mut(&6)
-            .unwrap()
-            .key_code = 65535;
+        if let Action::Shortcut(shortcut) =
+            c.mappings.get_mut("mouse").unwrap().get_mut(&6).unwrap()
+        {
+            shortcut.key_code = 65535;
+        }
         assert!(c.validate().is_err());
         assert!(serde_json::from_str::<Config>(r#"{"enabled":true,"unexpected":true}"#).is_err());
     }
@@ -188,5 +218,39 @@ mod tests {
         assert_eq!(c.actions("mouse", previous, current).len(), 1);
         assert_eq!(state.transition(0x20), None);
         assert_eq!(ButtonState::default().transition(0x20), None);
+    }
+    #[test]
+    fn legacy_shortcuts_and_system_actions_round_trip_and_trigger_once() {
+        let legacy = r#"{"enabled":true,"mappings":{"mouse":{"6":{"keyCode":6,"modifiers":{"command":true,"control":false,"option":false,"shift":false}}}}}"#;
+        let c: Config = serde_json::from_str(legacy).unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            serde_json::from_str::<serde_json::Value>(legacy).unwrap()
+        );
+        for name in ["missionControl", "applicationWindows", "showDesktop"] {
+            let json = format!(
+                r#"{{"enabled":true,"mappings":{{"mouse":{{"6":{{"systemAction":"{name}"}}}}}}}}"#
+            );
+            let c: Config = serde_json::from_str(&json).unwrap();
+            assert!(c.validate().is_ok());
+            assert_eq!(c.actions("mouse", 0, 0x20).len(), 1);
+            assert!(c.actions("mouse", 0x20, 0x20).is_empty());
+            assert!(c.actions("mouse", 0x20, 0).is_empty());
+            assert_eq!(
+                serde_json::to_value(&c).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&json).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn arbitrary_commands_and_mixed_action_fields_are_rejected() {
+        for action in [
+            r#"{"systemAction":"runCommand"}"#,
+            r#"{"systemAction":"missionControl","command":"curl example.com"}"#,
+            r#"{"systemAction":"missionControl","keyCode":6,"modifiers":{"command":true,"control":false,"option":false,"shift":false}}"#,
+        ] {
+            assert!(serde_json::from_str::<Action>(action).is_err());
+        }
     }
 }

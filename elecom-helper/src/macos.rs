@@ -2,7 +2,7 @@
 //! event tap, global keyboard listener, polling loop, HID writes or networking.
 use crate::{
     Shared,
-    model::{self, Shortcut},
+    model::{self, Action, Shortcut},
 };
 use serde::Serialize;
 use std::{
@@ -166,6 +166,31 @@ fn post_shortcut(action: &Shortcut) -> Result<(), &'static str> {
     }
 }
 
+fn perform_action(action: &Action) -> Result<(), String> {
+    match action {
+        Action::Shortcut(shortcut) => post_shortcut(shortcut).map_err(str::to_owned),
+        Action::System(binding) => {
+            // This tiny Apple-supplied program posts a Dock request and exits.
+            // No shell, private framework linkage, keyboard remap dependency,
+            // background child, network access or arbitrary command execution.
+            let result = std::process::Command::new(
+                "/System/Applications/Mission Control.app/Contents/MacOS/Mission Control",
+            )
+            .arg(binding.system_action.argument())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|error| format!("Could not launch macOS Mission Control: {error}"))?;
+            if result.success() {
+                Ok(())
+            } else {
+                Err(format!("macOS Mission Control failed: {result}"))
+            }
+        }
+    }
+}
+
 struct Input {
     device: Device,
     pid: u32,
@@ -236,10 +261,10 @@ unsafe extern "C" fn report(
             }
         }
         for action in actions {
-            if let Err(error) = post_shortcut(&action)
+            if let Err(error) = perform_action(&action)
                 && let Ok(mut value) = input.shared.error.lock()
             {
-                *value = Some(error.into());
+                *value = Some(error);
             }
         }
     }
